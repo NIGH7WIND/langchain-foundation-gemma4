@@ -1,7 +1,6 @@
-import ast
-import re
+import pprint
 import sqlite3
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -40,9 +39,6 @@ model = init_chat_model(
 
 SYSTEM_PROMPT = """You are a SQLite database assistant with access to the `sql_query` tool.
 
-    ENGINE & DIALECT:
-    - Engine: SQLite.
-    - Do NOT use MySQL syntax like `SHOW TABLES;`. 
     FIRST ALWAYS USE `PRAGMA table_list;` or `PRAGMA table_info(table_name);` to find the relevant table.
 
     CRITICAL CONSTRAINTS:
@@ -53,6 +49,10 @@ SYSTEM_PROMPT = """You are a SQLite database assistant with access to the `sql_q
     - If a query returns an OperationalError or syntax error, NEVER submit the exact same query again.
     3. SQL CLAUSE ORDER ENFORCEMENT:
     - SELECT -> FROM -> [JOIN] -> WHERE -> GROUP BY -> HAVING -> ORDER BY -> LIMIT.
+
+    "When asked for a 'full name', concatenate FirstName || ' ' || LastName into a single column unless requested otherwise."
+    "Prefer unique fields while grouping"
+
 
     WORKFLOW:
     1. Inspect schema if needed.
@@ -78,24 +78,24 @@ TEST_SUITE = [
     },
     {
         "id": "3_group_by_count",
-        "prompt": "Show the top 10 artists by total number of albums. Display the artist name and album count, ordered from most albums to least.",
+        "prompt": "Show the top 10 artists by total number of albums. Display the artist name and album count, ordered from most albums to least. If tied, order alphabetically by artist name.",
         "ground_truth_sql": """
             SELECT art.Name AS ArtistName, COUNT(alb.AlbumId) AS AlbumCount
             FROM Artist art
             JOIN Album alb ON art.ArtistId = alb.ArtistId
             GROUP BY art.ArtistId, art.Name
-            ORDER BY AlbumCount DESC
+            ORDER BY AlbumCount DESC, art.Name ASC
             LIMIT 10;
         """,
     },
     {
         "id": "4_self_join_null",
-        "prompt": "List all employees with their title, alongside their direct manager's full name. Include employees who do not have a manager.",
+        "prompt": "List the full name of each employee, their title, and their direct manager's full name. Include employees who do not have a manager.",
         "ground_truth_sql": """
             SELECT 
                 emp.FirstName || ' ' || emp.LastName AS EmployeeName,
                 emp.Title,
-                COALESCE(mgr.FirstName || ' ' || mgr.LastName, 'No Manager') AS ManagerName
+                mgr.FirstName || ' ' || mgr.LastName AS ManagerName
             FROM Employee emp
             LEFT JOIN Employee mgr ON emp.ReportsTo = mgr.EmployeeId;
         """,
@@ -125,7 +125,7 @@ TEST_SUITE = [
                 ROUND(SUM(i.Total), 2) AS TotalSpent
             FROM Customer c
             JOIN Invoice i ON c.CustomerId = i.CustomerId
-            GROUP BY c.CustomerId, FullName
+            GROUP BY c.CustomerId, c.FirstName, c.LastName
             HAVING SUM(i.Total) > 40.0
             ORDER BY TotalSpent DESC
             LIMIT 10;
@@ -169,7 +169,6 @@ def run_sql_readonly(query: str) -> Tuple[bool, Optional[List[Tuple]], Optional[
         if conn:
             conn.close()
 
-
 def extract_queries_from_messages(messages: List[Any]) -> List[str]:
     """Extracts all SQL queries invoked by the agent across tool calls."""
     queries = []
@@ -192,6 +191,7 @@ def evaluate_agent():
     for test in TEST_SUITE:
         prompt = test["prompt"]
         gt_sql = test["ground_truth_sql"]
+        print(f"\n{'-'*60}")
         print(f"[*] Testing: {test['id']}")
         print(f"    Prompt: {prompt}")
 
@@ -212,20 +212,26 @@ def evaluate_agent():
         data_queries = [q for q in executed_queries if not q.strip().upper().startswith("PRAGMA")]
         final_query = data_queries[-1] if data_queries else (executed_queries[-1] if executed_queries else None)
 
+        # Print the agent's final text response
+        if messages and hasattr(messages[-1], "content"):
+            print(f"\n    [Agent Final Text Response]:\n    {messages[-1].content.strip()}")
+
         if not final_query:
-            print("    [-] Verdict: FAIL (Agent did not invoke sql_query with a SELECT query)\n")
+            print("\n    [-] Verdict: FAIL (Agent did not invoke sql_query with a SELECT query)\n")
             continue
+
+        print(f"\n    [Ground Truth SQL]:\n    {gt_sql.strip()}")
+        print(f"\n    [Model Executed SQL]:\n    {final_query.strip()}")
 
         # 3. Execute both queries and compare results
         gt_ok, gt_rows, gt_err = run_sql_readonly(gt_sql)
         gen_ok, gen_rows, gen_err = run_sql_readonly(final_query)
 
         if not gen_ok:
-            print(f"    [-] Verdict: FAIL (Model SQL syntax/execution error: {gen_err})")
-            print(f"        Query: {final_query}\n")
+            print(f"\n    [-] Verdict: FAIL (Model SQL execution error: {gen_err})")
             continue
 
-        # Check equality: exact match OR set match (if row order was not strictly required)
+        # Check equality: exact match OR set match
         is_exact = gen_rows == gt_rows
         try:
             is_set = set(gen_rows) == set(gt_rows)
@@ -234,19 +240,21 @@ def evaluate_agent():
 
         passed = is_exact or is_set
 
+        # Print all retrieved rows
+        print(f"\n    [Model Rows] ({len(gen_rows)} total):")
+        pprint.pprint(gen_rows, indent=8)
+
+        print(f"\n    [Expected Rows] ({len(gt_rows)} total):")
+        pprint.pprint(gt_rows, indent=8)
+
         if passed:
             passed_tests += 1
-            print(f"    [+] Verdict: PASS ({'Exact Order Match' if is_exact else 'Set Match'})")
-            print(f"        Rows returned: {len(gen_rows)}")
+            print(f"\n    [+] Verdict: PASS ({'Exact Order Match' if is_exact else 'Set Match'})")
         else:
-            print(f"    [-] Verdict: FAIL (Result mismatch)")
-            print(f"        Model SQL: {final_query}")
-            print(f"        Model Rows (count={len(gen_rows)}): {gen_rows[:2]}...")
-            print(f"        Expected Rows (count={len(gt_rows)}): {gt_rows[:2]}...")
-        print()
+            print(f"\n    [-] Verdict: FAIL (Result mismatch)")
 
     acc = (passed_tests / len(TEST_SUITE)) * 100
-    print(f"{'='*70}")
+    print(f"\n{'='*70}")
     print(f"BENCHMARK COMPLETE: {passed_tests}/{len(TEST_SUITE)} Passed ({acc:.1f}% Accuracy)")
     print(f"{'='*70}\n")
 

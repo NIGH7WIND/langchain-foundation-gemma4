@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from langchain.agents import AgentState, create_agent
 from langchain.tools import tool, ToolRuntime
 from langgraph.types import Command
+from langchain.chat_models import init_chat_model
 from langchain.messages import ToolMessage
 from langchain.agents.middleware import wrap_model_call, dynamic_prompt, HumanInTheLoopMiddleware
 from langchain.agents.middleware import ModelRequest, ModelResponse
@@ -92,8 +93,15 @@ def dynamic_prompt_func(request: ModelRequest) -> str:
         return unauthenticated_prompt
 
 
+model = init_chat_model(
+    model="gemma4",
+    model_provider="openai",
+    api_key="dummy",
+    base_url="http://localhost:8080/v1"
+)
+
 agent = create_agent(
-        "gpt-5-nano",
+        model=model,
         tools=[authenticate, check_inbox, send_email],
         state_schema=AuthenticatedState,
         context_schema=EmailContext,
