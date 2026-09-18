@@ -1,6 +1,6 @@
 import pprint
 import sqlite3
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -145,29 +145,193 @@ TEST_SUITE = [
     },
 ]
 
+HARDER_TEST_CASES = [
+    {
+        "id": "8_ambiguous_column_having",
+        "prompt": "List the first 10 albums (alphabetically by title) with their artist's name, for albums with more than 15 tracks.",
+        "ground_truth_sql": """
+            SELECT alb.Title, art.Name AS ArtistName
+            FROM Album alb
+            JOIN Artist art ON alb.ArtistId = art.ArtistId
+            JOIN Track t ON t.AlbumId = alb.AlbumId
+            GROUP BY alb.AlbumId, alb.Title, art.Name
+            HAVING COUNT(t.TrackId) > 15
+            ORDER BY alb.Title
+            LIMIT 10;
+        """,
+    },
+    {
+        "id": "9_correlated_subquery_avg",
+        "prompt": "Find the top 10 customers by total spending (summed from their invoices), among customers whose total spending is above the average total spent per customer. Return customer ID, full name, and total spent. Break ties by customer ID ascending.",
+        "ground_truth_sql": """
+            WITH CustomerTotals AS (
+                SELECT CustomerId, SUM(Total) AS TotalSpent
+                FROM Invoice
+                GROUP BY CustomerId
+            )
+            SELECT c.CustomerId, c.FirstName || ' ' || c.LastName AS FullName, ct.TotalSpent
+            FROM Customer c
+            JOIN CustomerTotals ct ON c.CustomerId = ct.CustomerId
+            WHERE ct.TotalSpent > (SELECT AVG(TotalSpent) FROM CustomerTotals)
+            ORDER BY ct.TotalSpent DESC, c.CustomerId ASC
+            LIMIT 10;
+        """,
+    },
+    {
+        "id": "10_top_genre_per_customer",
+        "prompt": "For the first 10 customers by customer ID, find their most purchased genre by total quantity, and return customer full name and genre name.",
+        "ground_truth_sql": """
+            WITH GenreCounts AS (
+                SELECT c.CustomerId, c.FirstName || ' ' || c.LastName AS FullName,
+                    g.Name AS GenreName, SUM(il.Quantity) AS TotalQty,
+                    ROW_NUMBER() OVER (PARTITION BY c.CustomerId ORDER BY SUM(il.Quantity) DESC, g.Name ASC) AS rn
+                FROM Customer c
+                JOIN Invoice i ON c.CustomerId = i.CustomerId
+                JOIN InvoiceLine il ON i.InvoiceId = il.InvoiceId
+                JOIN Track t ON il.TrackId = t.TrackId
+                JOIN Genre g ON t.GenreId = g.GenreId
+                WHERE c.CustomerId <= 10
+                GROUP BY c.CustomerId, FullName, g.Name
+            )
+            SELECT FullName, GenreName
+            FROM GenreCounts
+            WHERE rn = 1
+            ORDER BY CustomerId
+            LIMIT 10;
+        """,
+    },
+    {
+        "id": "11_recursive_hierarchy",
+        "prompt": "List the first 10 employees (by employee ID) who report, directly or indirectly, to Andrew Adams. Return employee ID, first name, and last name",
+        "ground_truth_sql": """
+            WITH RECURSIVE Subordinates AS (
+                SELECT EmployeeId, FirstName, LastName, ReportsTo
+                FROM Employee
+                WHERE ReportsTo = (SELECT EmployeeId FROM Employee WHERE FirstName='Andrew' AND LastName='Adams')
+                UNION ALL
+                SELECT e.EmployeeId, e.FirstName, e.LastName, e.ReportsTo
+                FROM Employee e
+                JOIN Subordinates s ON e.ReportsTo = s.EmployeeId
+            )
+            SELECT EmployeeId, FirstName, LastName
+            FROM Subordinates
+            ORDER BY EmployeeId
+            LIMIT 10;
+        """,
+    },
+    # {
+    #     "id": "12_monthly_revenue_2010",
+    #     "prompt": "Find total revenue by month for 2010, ordered chronologically.",
+    #     "ground_truth_sql": """
+    #         SELECT strftime('%Y-%m', InvoiceDate) AS Month, ROUND(SUM(Total), 2) AS Revenue
+    #         FROM Invoice
+    #         WHERE strftime('%Y', InvoiceDate) = '2010'
+    #         GROUP BY Month
+    #         ORDER BY Month ASC
+    #         LIMIT 10;
+    #     """,
+    # },
+    # {
+    #     "id": "13_exclusion_genre",
+    #     "prompt": "List the first 10 customers (by customer ID) who have never purchased a track in the 'Jazz' genre.",
+    #     "ground_truth_sql": """
+    #         SELECT c.CustomerId, c.FirstName || ' ' || c.LastName AS FullName
+    #         FROM Customer c
+    #         WHERE c.CustomerId NOT IN (
+    #             SELECT i.CustomerId
+    #             FROM Invoice i
+    #             JOIN InvoiceLine il ON i.InvoiceId = il.InvoiceId
+    #             JOIN Track t ON il.TrackId = t.TrackId
+    #             JOIN Genre g ON t.GenreId = g.GenreId
+    #             WHERE g.Name = 'Jazz'
+    #         )
+    #         ORDER BY c.CustomerId
+    #         LIMIT 10;
+    #     """,
+    # },
+    # {
+    #     "id": "14_schema_trap_junction_table",
+    #     "prompt": "How many playlists contain more than 100 tracks?",
+    #     "ground_truth_sql": """
+    #         SELECT COUNT(*) AS PlaylistCount
+    #         FROM (
+    #             SELECT p.PlaylistId
+    #             FROM Playlist p
+    #             JOIN PlaylistTrack pt ON p.PlaylistId = pt.PlaylistId
+    #             GROUP BY p.PlaylistId
+    #             HAVING COUNT(pt.TrackId) > 100
+    #         ) sub;
+    #     """,
+    # },
+    # {
+    #     "id": "15_ties_max_tracks",
+    #     "prompt": "Which artist(s) have the most tracks, and how many tracks is that? List up to 10, alphabetically.",
+    #     "ground_truth_sql": """
+    #         WITH ArtistTrackCounts AS (
+    #             SELECT art.ArtistId, art.Name, COUNT(t.TrackId) AS TrackCount
+    #             FROM Artist art
+    #             JOIN Album alb ON art.ArtistId = alb.ArtistId
+    #             JOIN Track t ON t.AlbumId = alb.AlbumId
+    #             GROUP BY art.ArtistId, art.Name
+    #         )
+    #         SELECT Name, TrackCount
+    #         FROM ArtistTrackCounts
+    #         WHERE TrackCount = (SELECT MAX(TrackCount) FROM ArtistTrackCounts)
+    #         ORDER BY Name
+    #         LIMIT 10;
+    #     """,
+    # },
+]
+
+TEST_SUITE.extend(HARDER_TEST_CASES)
+
 # -------------------------------------------------------------------------
 # 4. Result Evaluator
 # -------------------------------------------------------------------------
-def run_sql_readonly(query: str) -> Tuple[bool, Optional[List[Tuple]], Optional[str]]:
-    """Executes query in read-only mode and normalizes floats."""
+import threading
+
+def run_sql_readonly(query: str, timeout: float = 10.0) -> Tuple[bool, Optional[List[Tuple]], Optional[str]]:
+    """Executes query in read-only mode with a wall-clock timeout. Normalizes floats."""
     conn = None
-    try:
-        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-        cursor = conn.cursor()
-        cursor.execute(query.strip().rstrip(";"))
-        rows = cursor.fetchall()
-        
-        # Round floats to 2 decimal places for consistent comparison
-        normalized = [
-            tuple(round(val, 2) if isinstance(val, float) else val for val in row)
-            for row in rows
-        ]
-        return True, normalized, None
-    except Exception as e:
-        return False, None, str(e)
-    finally:
-        if conn:
-            conn.close()
+    result: Dict[str, Any] = {"ok": False, "rows": None, "err": None}
+    timed_out = threading.Event()
+
+    def _worker():
+        nonlocal conn
+        try:
+            conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+
+            # Abort query if it runs too long (checked every N VM instructions)
+            def _progress_handler():
+                return 1 if timed_out.is_set() else 0
+            conn.set_progress_handler(_progress_handler, 1000)
+
+            cursor = conn.cursor()
+            cursor.execute(query.strip().rstrip(";"))
+            rows = cursor.fetchmany(1000)  # cap result size defensively
+
+            normalized = [
+                tuple(round(val, 2) if isinstance(val, float) else val for val in row)
+                for row in rows
+            ]
+            result["ok"] = True
+            result["rows"] = normalized
+        except Exception as e:
+            result["err"] = str(e)
+        finally:
+            if conn:
+                conn.close()
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+
+    if thread.is_alive():
+        timed_out.set()
+        thread.join(timeout=2)  # give progress handler a moment to abort
+        return False, None, f"Query timed out after {timeout}s (possible runaway recursion)"
+
+    return result["ok"], result["rows"], result["err"]
 
 def extract_queries_from_messages(messages: List[Any]) -> List[str]:
     """Extracts all SQL queries invoked by the agent across tool calls."""
